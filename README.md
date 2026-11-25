@@ -34,3 +34,12 @@ python3 samsung_tv_cleanup.py --print-blocklist                          # Pi-ho
 app store and firmware servers. The blocklist here is already narrowed to the safe ad subdomains.
 
 Undo: vetro's Restore reverses the TV changes; remove the domains / access profile in your router.
+
+## Credits
+
+The root and on-TV debloat are powered by other projects — this repo adds the router blocklist
+script and the written walkthrough:
+
+- [vetro](https://github.com/andrearicci93/vetro) — on-TV launcher, debloater and dashboard
+- [Apps2Samsung](https://github.com/Apps2Samsung/Apps2Samsung) — one-click installer/signer for the TV
+- [chris-ritsen/samsung-tv-root](https://github.com/chris-ritsen/samsung-tv-root) — the root research

@@ -42,7 +42,7 @@ install for you.
 
 ---
 
-## Step 3 — Debloat (vetro dashboard, from any browser)
+## Step 3 — Debloat ([vetro](https://github.com/andrearicci93/vetro) dashboard, from any browser)
 
 Open **`http://<TV-IP>:8099`** in a browser on your network (vetro shows the exact address on the
 TV). Every toggle is reversible via its Restore button.
@@ -119,3 +119,19 @@ them makes the Apps panel fail with "server isn't available."
   the TV wasn't restarted after enabling it. Fix and reboot.
 - **Undo everything** → vetro's Restore puts packages back; remove the DNS block in your router;
   turn Developer Mode off.
+
+---
+
+## Credits
+
+The root and on-TV debloat are other people's work — this repo only adds the router-side blocklist
+script and this walkthrough:
+
+- **[vetro](https://github.com/andrearicci93/vetro)** — the launcher, debloater and dashboard that
+  does all the on-TV work.
+- **[Apps2Samsung](https://github.com/Apps2Samsung/Apps2Samsung)** — the one-click installer/signer
+  that gets vetro onto the TV.
+- **[chris-ritsen/samsung-tv-root](https://github.com/chris-ritsen/samsung-tv-root)** — the root
+  research vetro builds on.
+
+Follow each project's own instructions and licenses; they can change independently of this guide.
