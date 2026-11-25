@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
-"""Samsung Tizen TV cleanup: close bloat apps and block Samsung ads + tracking at the router.
+"""Samsung Tizen TV cleanup: close bloat apps and block Samsung's ad and tracking servers.
 
-This handles the NETWORK layer only (DNS blocking + closing apps). Removing apps, killing
-telemetry at the source and a Plex/YouTube launcher need root -- see GUIDE.md for that flow
-(Developer Mode -> Apps2Samsung -> vetro). The DNS block here is a good standalone layer and
-stacks under root.
+This script works on the network only. It blocks DNS names at the router and closes apps that
+run in the background. Removing apps, turning off telemetry on the TV, and a launcher for apps
+such as Plex and YouTube need root. GUIDE.md covers root: Developer Mode, then Apps2Samsung, then
+vetro. The DNS block works without root and adds a second layer to a rooted TV.
 
-Python 3.9+, standard library only. Pick your router:
+The script needs Python 3.9 or later and only the standard library. Pick your router:
 
-  python3 samsung_tv_cleanup.py --tv 192.168.1.50                        # just close bloat apps
+  python3 samsung_tv_cleanup.py --tv 192.168.1.50                        # close bloat apps only
   python3 samsung_tv_cleanup.py --fritz-device S95B                      # FRITZ!Box
   python3 samsung_tv_cleanup.py --unifi-host 192.168.1.1 --unifi-tv-mac AA:BB:CC:DD:EE:FF
-  python3 samsung_tv_cleanup.py --print-blocklist                        # Pi-hole / AdGuard Home
+  python3 samsung_tv_cleanup.py --print-blocklist                        # Pi-hole or AdGuard Home
 """
 import argparse
 import getpass
@@ -27,17 +27,19 @@ import xml.etree.ElementTree as ET
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    """Refuse to follow redirects, so authenticated headers (SID, X-API-KEY) are never
-    re-sent to a different origin. urllib raises the 3xx as an error instead."""
+    """Refuse redirects, so the SID and X-API-KEY headers never go to a different origin.
+
+    urllib then raises the 3xx response as an error."""
 
     def redirect_request(self, *args):
         return None
 
-# Ad, viewing-tracking (ACR), remote-management and crash-report hosts. Deliberately leaves out
-# samsungcloudsolution.com/.net as a whole and samsungotn.net: blocking those breaks the app
-# store and firmware updates. For the same reason block only gpm.samsungqbe.com (ads), NOT the
-# bare samsungqbe.com -- that parent also hosts osb.samsungqbe.com, the app-store backend, and
-# blocking it makes the Apps panel fail with "server isn't available".
+# Hosts for ads, viewing tracking (ACR), remote management, and crash reports. The list leaves
+# out samsungotn.net and the whole of samsungcloudsolution.com and samsungcloudsolution.net,
+# because blocking them breaks the app store and firmware updates. For the same reason it blocks
+# gpm.samsungqbe.com, the ad host, and leaves the bare samsungqbe.com alone. That parent domain
+# also hosts osb.samsungqbe.com, the app store backend. Blocking it makes the Apps panel fail
+# with "server isn't available".
 BLOCKLIST = [
     "samsungads.com",
     "samsungadhub.com",
@@ -73,12 +75,13 @@ PROFILE_NAME = "Samsung TV"
 CHECKLIST = """
 CHECKLIST: do these on the TV with the remote
   1. Settings > General & Privacy > Terms & Privacy > Privacy Choices:
-     turn OFF Viewing Information Services, Interest-Based Advertisement, Voice Recognition Services.
+     turn OFF Viewing Information Services, Interest-Based Advertisement and
+     Voice Recognition Services.
   2. Settings > General & Privacy > Start Screen Option: turn OFF "Start with Home Screen".
-  3. Home > Apps > gear icon: delete every app you don't use (preinstalled system apps
-     such as Samsung TV Plus, Gaming Hub or SmartThings can't be removed).
+  3. Home > Apps > gear icon: delete every app you don't use. Preinstalled system apps,
+     such as Samsung TV Plus, Gaming Hub and SmartThings, can't be removed.
   4. Settings > Support > Device Care > Start Device Care.
-  5. Hold the remote's power button until the Samsung logo appears (full restart).
+  5. For a full restart, hold the remote's power button until the Samsung logo appears.
 """
 
 
@@ -110,20 +113,20 @@ def tv_cleanup(ip, keep):
         try:
             app = json.loads(http(f"http://{ip}:8001/api/v2/applications/{app_id}", timeout=4))
         except Exception:
-            continue  # not installed, or unreachable -- skip, keep going
+            continue  # The app isn't installed or the TV didn't answer. Try the next app.
         running, visible = app.get("running"), app.get("visible")
         line = f"  installed: {name:<12} running={running} visible={visible}"
         if running and name not in keep:
             if visible is not False:
-                # Only close apps we KNOW are in the background; never interrupt something
-                # that's on screen (or whose visibility the TV didn't report).
-                line += "  -> left running (on screen or visibility unknown)"
+                # Close only apps that the TV reports as hidden. Never close an app that is on
+                # screen or whose visibility the TV didn't report.
+                line += ", left running because it is on screen or its visibility is unknown"
             else:
                 try:
                     http(f"http://{ip}:8001/api/v2/applications/{app_id}", method="DELETE")
-                    line += "  -> closed"
-                except Exception as e:  # one failed close must not abort later router actions
-                    line += f"  -> close failed ({e})"
+                    line += ", closed"
+                except Exception as e:  # A failed close must not stop the router steps that follow.
+                    line += f", close failed: {e}"
         print(line)
 
 
@@ -135,11 +138,12 @@ class Fritz:
         challenge_xml = ET.fromstring(http(f"{self.base}/login_sid.lua?version=2", no_redirect=True))
         block = int(challenge_xml.findtext("BlockTime") or "0")
         if block > 0:
-            sys.exit(f"FRITZ!Box login is rate-limited; wait {block}s and try again.")
+            sys.exit(f"FRITZ!Box login is rate-limited. Wait {block}s and try again.")
         user = user or challenge_xml.findtext("Users/User[@last='1']") or ""
         challenge = challenge_xml.findtext("Challenge") or ""
         if not challenge.startswith("2$"):
-            sys.exit("FRITZ!Box: unexpected or too-old login challenge (needs FRITZ!OS 7.24+).")
+            sys.exit("FRITZ!Box sent an unknown login challenge. "
+                     "The script needs FRITZ!OS 7.24 or later.")
         _, i1, s1, i2, s2 = challenge.split("$")
         h1 = hashlib.pbkdf2_hmac("sha256", password.encode(), bytes.fromhex(s1), int(i1))
         h2 = hashlib.pbkdf2_hmac("sha256", h1, bytes.fromhex(s2), int(i2))
@@ -148,8 +152,8 @@ class Fritz:
         self.sid = res.findtext("SID") or ""
         if not self.sid or set(self.sid) == {"0"}:
             wait = int(res.findtext("BlockTime") or "0")
-            hint = f" (rate-limited {wait}s after bad attempts)" if wait else ""
-            sys.exit(f"FRITZ!Box login failed for user '{user or '(default)'}'{hint}.")
+            hint = f" The router blocks logins for {wait}s after failed attempts." if wait else ""
+            sys.exit(f"FRITZ!Box login failed for user '{user or '(default)'}'.{hint}")
         print(f"FRITZ!Box: logged in as {user}")
 
     def page(self, page, **extra):
@@ -188,16 +192,17 @@ class Fritz:
         self.apply("kids_profileedit", oldpage="/internet/kids_profileedit.lua", edit="",
                    name=PROFILE_NAME, time="unlimited", budget="unlimited", parental="on",
                    filtertype="black", netappschosen="", **fields)
-        pid = self._find_profile()  # re-read ONCE; never recurse (would loop forever on a UI change)
+        # Read once more. Recursion would loop forever after a router UI change.
+        pid = self._find_profile()
         if not pid:
             sys.exit(f"FRITZ!Box: created profile '{PROFILE_NAME}' but can't find it on re-read. "
                      f"Check Internet > Filter > Access Profiles in the router UI.")
-        print(f"  profile '{PROFILE_NAME}' created (unlimited time, block list filter)")
+        print(f"  profile '{PROFILE_NAME}' created with unlimited time and the block list filter")
         return pid
 
     def device_profiles(self):
-        # Parse one <tr> at a time so a device name can never be paired with the NEXT row's
-        # dropdown (the old single cross-row regex could do that for a row with no selector).
+        # Parse one <tr> at a time, so a row without a dropdown never takes the next row's
+        # dropdown. One regex across all rows used to make that mistake.
         rows = {}
         for row in re.split(r"(?=<tr\b)", self.page("kidLis", xhrId="all")):
             nm = re.search(r'<td class="name" title="([^"]*)"', row)
@@ -209,7 +214,7 @@ class Fritz:
         return rows
 
     def require_device(self, device_name):
-        """Read-only check, run BEFORE any write, so a mistyped name can't mutate the shared list."""
+        """Check the device name before any write, so a typo can't change the shared list."""
         rows = self.device_profiles()
         if not any(t == device_name for t, _ in rows.values()):
             names = sorted({t for t, _ in rows.values()})
@@ -230,7 +235,7 @@ class Fritz:
         form[key] = profile_id
         self.apply("kidLis", **form)
         after = self.device_profiles()
-        if after.get(key, (None, None))[1] != profile_id:  # confirm the target actually changed
+        if after.get(key, (None, None))[1] != profile_id:  # Confirm that the TV's profile changed.
             sys.exit(f"FRITZ!Box: assigning '{PROFILE_NAME}' to '{device_name}' did not take. "
                      f"Check the router UI.")
         changed = [t for k, (t, p) in rows.items() if k in after and after[k][1] != p and t != device_name]
@@ -240,9 +245,10 @@ class Fritz:
 
 
 # ---------------------------------------------------------------- UniFi
-# NOTE: UniFi's content-filter API is undocumented (reverse-engineered from the web UI) and has
-# shifted between UniFi OS versions. This is best-effort: it UPDATES an existing Content Filter
-# policy you create once in the UI. If anything looks off, do it in the UI (see GUIDE.md).
+# UniFi's content-filter API is undocumented. This code copies the calls the web UI makes, and
+# the API has changed between UniFi OS versions. The code updates a Content Filter policy that
+# you create once in the UI. If the result looks wrong, make the change in the UI as GUIDE.md
+# describes.
 
 class UniFi:
     def __init__(self, host, api_key, site="default"):
@@ -250,9 +256,10 @@ class UniFi:
         self.site = site
         self.ctx = ssl.create_default_context()
         self.ctx.check_hostname = False
-        self.ctx.verify_mode = ssl.CERT_NONE  # UniFi gateways use a self-signed cert
+        self.ctx.verify_mode = ssl.CERT_NONE  # UniFi gateways use a self-signed certificate.
         self.key = api_key
-        print(f"UniFi: gateway {host}, site '{site}' (API is unofficial; verify in the UI afterwards)")
+        print(f"UniFi: gateway {host}, site '{site}'. "
+              "The API is unofficial, so check the UI afterward.")
 
     def _req(self, path, method="GET", body=None):
         headers = {"X-API-KEY": self.key, "Accept": "application/json"}
@@ -269,7 +276,7 @@ class UniFi:
     def apply_block(self, policy_name, tv_mac):
         pols = self.policies()
         match = [p for p in pols if p.get("name") == policy_name]
-        if len(match) != 1:  # never guess which one; a wrong policy can filter unrelated clients
+        if len(match) != 1:  # Never guess. The wrong policy can filter unrelated clients.
             names = [p.get("name") for p in pols] or ["(none)"]
             sys.exit(f"Need exactly one Content Filter named '{policy_name}', found {len(match)}. "
                      f"Create or rename it in the UI (Settings > CyberSecure > Content Filter), "
@@ -277,13 +284,13 @@ class UniFi:
         pol = match[0]
         pid = pol.get("_id") or pol.get("id")
         if not pid:
-            sys.exit("UniFi: matched policy has no id field -- schema differs on your UniFi OS "
-                     "version. Add the domains in the UI instead (see GUIDE.md).")
+            sys.exit("UniFi: the matched policy has no id field, so your UniFi OS version uses "
+                     "a different schema. Add the domains in the UI as GUIDE.md describes.")
         existing = [m.lower() for m in (pol.get("client_macs") or [])]
         others = [m for m in existing if not (tv_mac and m == tv_mac.lower())]
         if others:
-            print(f"  WARNING: this policy already targets {len(others)} other client(s) "
-                  f"({', '.join(others)}); they will get this blocklist too.")
+            print(f"  WARNING: this policy already targets other clients: {', '.join(others)}. "
+                  f"They will get this blocklist too.")
         block = pol.get("block_list") or []
         merged = block + [d for d in BLOCKLIST if d not in block]
         macs = existing + ([tv_mac.lower()] if tv_mac and tv_mac.lower() not in existing else [])
@@ -295,8 +302,8 @@ class UniFi:
         verified = bool(after) and set(BLOCKLIST).issubset(set(after[0].get("block_list") or []))
         added = len(merged) - len(block)
         print(f"  Content Filter '{policy_name}': {len(block)} existing + {added} added "
-              f"= {len(merged)} domains, scoped to {len(macs)} device(s). "
-              f"Read-back: {'OK' if verified else 'COULD NOT VERIFY -- check the UI'}")
+              f"= {len(merged)} domains, scoped to {len(macs)} devices. "
+              f"Read-back: {'OK' if verified else 'COULD NOT VERIFY, check the UI'}")
 
 
 def _fritz_password(a):
@@ -307,21 +314,22 @@ def _fritz_password(a):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--tv", help="TV IP address")
-    ap.add_argument("--keep", default=KEEP_DEFAULT, help=f"apps left running (default {KEEP_DEFAULT})")
-    ap.add_argument("--fritz-device", help="TV's name as shown in FRITZ!Box > Internet > Filter")
+    ap.add_argument("--tv", help="the TV's IP address")
+    ap.add_argument("--keep", default=KEEP_DEFAULT, help=f"apps to leave running, default {KEEP_DEFAULT}")
+    ap.add_argument("--fritz-device", help="the TV's name in FRITZ!Box > Internet > Filter")
     ap.add_argument("--list-fritz-devices", action="store_true",
                     help="log in and list FRITZ!Box device names, then exit")
     ap.add_argument("--fritz-host", default="fritz.box")
     ap.add_argument("--fritz-user", help="defaults to the last user that logged in")
-    ap.add_argument("--fritz-password-file", help="read password from file instead of prompting")
-    ap.add_argument("--unifi-host", help="UniFi gateway IP (UDM/UCG/UDR/Express)")
+    ap.add_argument("--fritz-password-file", help="read the password from this file instead of asking for it")
+    ap.add_argument("--unifi-host", help="IP address of the UniFi gateway, such as a UDM, UCG, UDR, or Express")
     ap.add_argument("--unifi-filter", default="Samsung TV",
-                    help="name of the Content Filter policy to update (create it in the UI first)")
-    ap.add_argument("--unifi-tv-mac", help="TV MAC address, to scope the filter to just the TV")
+                    help="name of the Content Filter policy to update, which you create in the UI first")
+    ap.add_argument("--unifi-tv-mac", help="the TV's MAC address, to scope the filter to the TV only")
     ap.add_argument("--unifi-site", default="default")
-    ap.add_argument("--unifi-key-file", help="read UniFi API key from file instead of prompting")
-    ap.add_argument("--print-blocklist", action="store_true")
+    ap.add_argument("--unifi-key-file", help="read the UniFi API key from this file instead of asking for it")
+    ap.add_argument("--print-blocklist", action="store_true",
+                    help="print the blocklist for Pi-hole or AdGuard Home, then exit")
     a = ap.parse_args()
 
     if a.print_blocklist:
@@ -336,13 +344,13 @@ def main():
             box.logout()
         return
     if not (a.tv or a.fritz_device or a.unifi_host):
-        ap.error("pass --tv and/or a router target (--fritz-device or --unifi-host)")
+        ap.error("pass --tv, a router target such as --fritz-device or --unifi-host, or both")
     if a.tv:
         tv_cleanup(a.tv, set(a.keep.split(",")))
     if a.fritz_device:
         box = Fritz(a.fritz_host, a.fritz_user, _fritz_password(a))
         try:
-            box.require_device(a.fritz_device)  # validate BEFORE writing the shared block list
+            box.require_device(a.fritz_device)  # Check the name before writing the shared block list.
             box.merge_blocklist()
             box.assign(a.fritz_device, box.ensure_profile())
         finally:
