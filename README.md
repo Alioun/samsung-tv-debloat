@@ -25,7 +25,8 @@ python3 samsung_tv_cleanup.py --print-blocklist                          # Pi-ho
 
 - **FRITZ!Box:** adds the domains to Internet → Filter → Lists (keeping what's there), makes a
   "Samsung TV" access profile using them, and assigns it to the TV only. Prompts for the router
-  password; doesn't store it. Run without `--fritz-device` to list device names.
+  password; doesn't store it. Run `--list-fritz-devices` to print the exact device names first.
+  Delete any `--fritz-password-file` / `--unifi-key-file` after use (owner-only perms while it exists).
 - **UniFi:** updates a Content Filter policy you create once in the UI, scoped to the TV's MAC.
   The UniFi API is unofficial — verify in the UI afterward. See GUIDE.md Step 4.
 - **Pi-hole / AdGuard Home:** `--print-blocklist` and paste the output into your blocklist.

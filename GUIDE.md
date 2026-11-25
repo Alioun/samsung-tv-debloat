@@ -1,12 +1,25 @@
 # Samsung Tizen TV — debloat & de-ad, start to finish
 
 End result: no home-screen ads, telemetry/ACR off, Samsung bloat gone, a launcher that boots
-straight to your apps, and more free RAM so the UI isn't sluggish. Everything here is reversible.
-
-Tested on a 2022 S95B (Tizen 6.5, firmware 1720). Works on most 2021–2025 Samsung TVs
-(Tizen 6–9). **Tizen 10 (2026) can't be rooted** — on those, do the DNS block (Step 4) only.
+straight to your apps, and more free RAM so the UI isn't sluggish. Most changes are reversible
+(see the caveats below) — but read "Before you start" first.
 
 You need: the TV's IP, a computer on the same network, and a phone with the **SmartThings** app.
+
+---
+
+## Before you start — compatibility & risks (read this)
+
+- **Check your TV is rootable.** This works on **Tizen 6–9** (most 2021–2025 Samsung TVs). Confirm
+  on the TV under Settings → Support → About This TV. **Tizen 10 (2026) can't be rooted** — on
+  those, do only the DNS block (Step 4). Tested end-to-end on a 2022 S95B (Tizen 6.5, firmware 1720).
+- **A firmware update can permanently remove root** — there are reports of a 2022 TV losing root to
+  a forced update, with no way back. Before you root, plan to turn auto-update **off** (Step 3) and
+  understand the trade-off: **no updates also means no security fixes**. Decide if you're OK with that.
+- **Not everything un-does cleanly.** Disabling a package via vetro is reversible; **uninstalling**
+  one is not always — some apps need a reinstall (from the store or a factory reset) and a few
+  settings need manual recovery. **Prefer Disable over Uninstall**, and don't remove an app unless
+  you know how to get it back.
 
 ---
 
@@ -45,7 +58,8 @@ install for you.
 ## Step 3 — Debloat ([vetro](https://github.com/andrearicci93/vetro) dashboard, from any browser)
 
 Open **`http://<TV-IP>:8099`** in a browser on your network (vetro shows the exact address on the
-TV). Every toggle is reversible via its Restore button.
+TV). **Disable** actions are reversible via Restore; **Uninstall** is not always (see "Before you
+start"). Favour Disable, and keep this tab open so you can flip anything back immediately.
 
 **Do this FIRST — lock auto-update (protects your root):**
 - In vetro's **Disable** area, turn off the software auto-updater (`swu-auto-upgrade`).
@@ -57,8 +71,9 @@ ads (`adplatform.ADPlayer`, `targeted-ad-service`), analytics (`samsung-analytic
 `com.samsung.tv.cis`). On **2022** sets also disable **`com.samsung.tv.iacr`** and
 **`com.samsung.tv.screen-analysis-dbmgr`** — the catalog may not flag these automatically.
 
-**Free RAM (Disable / Uninstall):** Samsung TV Plus and Art/Ambient mode (biggest wins), HbbTV,
-Vision AI, Bixby/voice. Uninstall anything you don't use (keep your streaming apps).
+**Free RAM (prefer Disable):** Samsung TV Plus and Art/Ambient mode (biggest wins), HbbTV,
+Vision AI, Bixby/voice — **Disable** these; it's fully reversible. Only **Uninstall** an app if you
+don't use it *and* know how to reinstall it (keep your streaming apps).
 
 **Launcher:** point vetro's replacement launcher at the apps you actually use, so the TV skips
 Samsung Home.

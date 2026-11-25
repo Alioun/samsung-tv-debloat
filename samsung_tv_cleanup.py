@@ -16,6 +16,7 @@ Python 3.9+, standard library only. Pick your router:
 import argparse
 import getpass
 import hashlib
+import html
 import json
 import re
 import ssl
@@ -23,6 +24,14 @@ import sys
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Refuse to follow redirects, so authenticated headers (SID, X-API-KEY) are never
+    re-sent to a different origin. urllib raises the 3xx as an error instead."""
+
+    def redirect_request(self, *args):
+        return None
 
 # Ad, viewing-tracking (ACR), remote-management and crash-report hosts. Deliberately leaves out
 # samsungcloudsolution.com/.net as a whole and samsungotn.net: blocking those breaks the app
@@ -73,7 +82,8 @@ CHECKLIST: do these on the TV with the remote
 """
 
 
-def http(url, data=None, method=None, timeout=10, headers=None, context=None, json_body=None):
+def http(url, data=None, method=None, timeout=10, headers=None, context=None, json_body=None,
+         no_redirect=False):
     if json_body is not None:
         body = json.dumps(json_body).encode()
     elif isinstance(data, dict):
@@ -81,7 +91,13 @@ def http(url, data=None, method=None, timeout=10, headers=None, context=None, js
     else:
         body = data
     req = urllib.request.Request(url, data=body, method=method, headers=headers or {})
-    with urllib.request.urlopen(req, timeout=timeout, context=context) as r:
+    handlers = []
+    if context is not None:
+        handlers.append(urllib.request.HTTPSHandler(context=context))
+    if no_redirect:
+        handlers.append(_NoRedirect)
+    opener = urllib.request.build_opener(*handlers)
+    with opener.open(req, timeout=timeout) as r:
         return r.read().decode()
 
 
@@ -94,11 +110,20 @@ def tv_cleanup(ip, keep):
         try:
             app = json.loads(http(f"http://{ip}:8001/api/v2/applications/{app_id}", timeout=4))
         except Exception:
-            continue
-        line = f"  installed: {name:<12} running={app.get('running')}"
-        if app.get("running") and name not in keep:
-            http(f"http://{ip}:8001/api/v2/applications/{app_id}", method="DELETE")
-            line += "  -> closed"
+            continue  # not installed, or unreachable -- skip, keep going
+        running, visible = app.get("running"), app.get("visible")
+        line = f"  installed: {name:<12} running={running} visible={visible}"
+        if running and name not in keep:
+            if visible is not False:
+                # Only close apps we KNOW are in the background; never interrupt something
+                # that's on screen (or whose visibility the TV didn't report).
+                line += "  -> left running (on screen or visibility unknown)"
+            else:
+                try:
+                    http(f"http://{ip}:8001/api/v2/applications/{app_id}", method="DELETE")
+                    line += "  -> closed"
+                except Exception as e:  # one failed close must not abort later router actions
+                    line += f"  -> close failed ({e})"
         print(line)
 
 
@@ -107,24 +132,30 @@ def tv_cleanup(ip, keep):
 class Fritz:
     def __init__(self, host, user, password):
         self.base = f"http://{host}"
-        challenge_xml = ET.fromstring(http(f"{self.base}/login_sid.lua?version=2"))
+        challenge_xml = ET.fromstring(http(f"{self.base}/login_sid.lua?version=2", no_redirect=True))
+        block = int(challenge_xml.findtext("BlockTime") or "0")
+        if block > 0:
+            sys.exit(f"FRITZ!Box login is rate-limited; wait {block}s and try again.")
         user = user or challenge_xml.findtext("Users/User[@last='1']") or ""
-        challenge = challenge_xml.findtext("Challenge")
+        challenge = challenge_xml.findtext("Challenge") or ""
         if not challenge.startswith("2$"):
-            sys.exit("FRITZ!OS too old: needs 7.24 or newer (PBKDF2 login)")
+            sys.exit("FRITZ!Box: unexpected or too-old login challenge (needs FRITZ!OS 7.24+).")
         _, i1, s1, i2, s2 = challenge.split("$")
         h1 = hashlib.pbkdf2_hmac("sha256", password.encode(), bytes.fromhex(s1), int(i1))
         h2 = hashlib.pbkdf2_hmac("sha256", h1, bytes.fromhex(s2), int(i2))
         res = ET.fromstring(http(f"{self.base}/login_sid.lua?version=2",
-                                 {"username": user, "response": f"{s2}${h2.hex()}"}))
-        self.sid = res.findtext("SID")
-        if set(self.sid) == {"0"}:
-            sys.exit(f"FRITZ!Box login failed for user '{user}'")
+                                 {"username": user, "response": f"{s2}${h2.hex()}"}, no_redirect=True))
+        self.sid = res.findtext("SID") or ""
+        if not self.sid or set(self.sid) == {"0"}:
+            wait = int(res.findtext("BlockTime") or "0")
+            hint = f" (rate-limited {wait}s after bad attempts)" if wait else ""
+            sys.exit(f"FRITZ!Box login failed for user '{user or '(default)'}'{hint}.")
         print(f"FRITZ!Box: logged in as {user}")
 
     def page(self, page, **extra):
         return http(f"{self.base}/data.lua",
-                    {"sid": self.sid, "xhr": 1, "lang": "de", "page": page, **extra})
+                    {"sid": self.sid, "xhr": 1, "lang": "de", "page": page, **extra},
+                    no_redirect=True)
 
     def apply(self, page, **fields):
         res = json.loads(self.page(page, apply="", **fields))["data"]
@@ -142,35 +173,55 @@ class Fritz:
             self.apply("kids_blacklist", listtype="black", urllist="\r".join(current + missing))
         print(f"  block list: {len(current)} existing, {len(missing)} added")
 
+    def _find_profile(self):
+        page = self.page("kidLis", xhrId="all")
+        m = re.search(r'<option value="(filtprof\d+)"[^>]*>' + re.escape(PROFILE_NAME) + "<", page)
+        return m.group(1) if m else None
+
     def ensure_profile(self):
-        html = self.page("kidLis", xhrId="all")
-        m = re.search(r'<option value="(filtprof\d+)"[^>]*>' + re.escape(PROFILE_NAME) + "<", html)
-        if m:
+        pid = self._find_profile()
+        if pid:
             print(f"  profile '{PROFILE_NAME}' already exists")
-            return m.group(1)
+            return pid
         days = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
         fields = {f"hours_{d}": "24" for d in days} | {f"minutes_{d}": "00" for d in days}
         self.apply("kids_profileedit", oldpage="/internet/kids_profileedit.lua", edit="",
                    name=PROFILE_NAME, time="unlimited", budget="unlimited", parental="on",
                    filtertype="black", netappschosen="", **fields)
+        pid = self._find_profile()  # re-read ONCE; never recurse (would loop forever on a UI change)
+        if not pid:
+            sys.exit(f"FRITZ!Box: created profile '{PROFILE_NAME}' but can't find it on re-read. "
+                     f"Check Internet > Filter > Access Profiles in the router UI.")
         print(f"  profile '{PROFILE_NAME}' created (unlimited time, block list filter)")
-        return self.ensure_profile()
+        return pid
 
     def device_profiles(self):
-        html = self.page("kidLis", xhrId="all")
+        # Parse one <tr> at a time so a device name can never be paired with the NEXT row's
+        # dropdown (the old single cross-row regex could do that for a row with no selector).
         rows = {}
-        for m in re.finditer(r'<td class="name" title="([^"]*)".*?<select[^>]*name="(profile:[^"]+)"[^>]*>(.*?)</select>',
-                             html, re.S):
-            sel = re.search(r'<option value="([^"]+)" selected', m.group(3))
-            rows[m.group(2)] = (m.group(1), sel.group(1) if sel else None)
+        for row in re.split(r"(?=<tr\b)", self.page("kidLis", xhrId="all")):
+            nm = re.search(r'<td class="name" title="([^"]*)"', row)
+            se = re.search(r'<select[^>]*name="(profile:[^"]+)"[^>]*>(.*?)</select>', row, re.S)
+            if not (nm and se):
+                continue
+            sel = re.search(r'<option value="([^"]+)" selected', se.group(2))
+            rows[se.group(1)] = (html.unescape(nm.group(1)), sel.group(1) if sel else None)
         return rows
+
+    def require_device(self, device_name):
+        """Read-only check, run BEFORE any write, so a mistyped name can't mutate the shared list."""
+        rows = self.device_profiles()
+        if not any(t == device_name for t, _ in rows.values()):
+            names = sorted({t for t, _ in rows.values()})
+            sys.exit(f"No device named '{device_name}' in FRITZ!Box. Devices: {', '.join(names)}")
 
     def assign(self, device_name, profile_id):
         rows = self.device_profiles()
         matches = [k for k, (title, _) in rows.items() if title == device_name]
         if len(matches) != 1:
             names = sorted({t for t, _ in rows.values()})
-            sys.exit(f"Expected one device named '{device_name}', found {len(matches)}. Devices: {', '.join(names)}")
+            sys.exit(f"Expected one device named '{device_name}', found {len(matches)}. "
+                     f"Devices: {', '.join(names)}")
         key = matches[0]
         if rows[key][1] == profile_id:
             print(f"  '{device_name}' already uses '{PROFILE_NAME}'")
@@ -179,6 +230,9 @@ class Fritz:
         form[key] = profile_id
         self.apply("kidLis", **form)
         after = self.device_profiles()
+        if after.get(key, (None, None))[1] != profile_id:  # confirm the target actually changed
+            sys.exit(f"FRITZ!Box: assigning '{PROFILE_NAME}' to '{device_name}' did not take. "
+                     f"Check the router UI.")
         changed = [t for k, (t, p) in rows.items() if k in after and after[k][1] != p and t != device_name]
         if changed:
             print(f"  WARNING: other devices changed profile: {changed}")
@@ -204,7 +258,8 @@ class UniFi:
         headers = {"X-API-KEY": self.key, "Accept": "application/json"}
         if body is not None:
             headers["Content-Type"] = "application/json"
-        raw = http(f"{self.base}{path}", method=method, json_body=body, headers=headers, context=self.ctx)
+        raw = http(f"{self.base}{path}", method=method, json_body=body, headers=headers,
+                   context=self.ctx, no_redirect=True)
         return json.loads(raw) if raw.strip() else {}
 
     def policies(self):
@@ -214,25 +269,40 @@ class UniFi:
     def apply_block(self, policy_name, tv_mac):
         pols = self.policies()
         match = [p for p in pols if p.get("name") == policy_name]
-        if not match:
+        if len(match) != 1:  # never guess which one; a wrong policy can filter unrelated clients
             names = [p.get("name") for p in pols] or ["(none)"]
-            sys.exit(f"No Content Filter named '{policy_name}'. Create one in the UI first "
-                     f"(Settings > CyberSecure > Content Filter), scope it to the TV, then re-run. "
-                     f"Existing policies: {names}")
+            sys.exit(f"Need exactly one Content Filter named '{policy_name}', found {len(match)}. "
+                     f"Create or rename it in the UI (Settings > CyberSecure > Content Filter), "
+                     f"scope it to the TV, then re-run. Existing policies: {names}")
         pol = match[0]
         pid = pol.get("_id") or pol.get("id")
+        if not pid:
+            sys.exit("UniFi: matched policy has no id field -- schema differs on your UniFi OS "
+                     "version. Add the domains in the UI instead (see GUIDE.md).")
+        existing = [m.lower() for m in (pol.get("client_macs") or [])]
+        others = [m for m in existing if not (tv_mac and m == tv_mac.lower())]
+        if others:
+            print(f"  WARNING: this policy already targets {len(others)} other client(s) "
+                  f"({', '.join(others)}); they will get this blocklist too.")
         block = pol.get("block_list") or []
         merged = block + [d for d in BLOCKLIST if d not in block]
-        macs = pol.get("client_macs") or []
-        if tv_mac and tv_mac.lower() not in [m.lower() for m in macs]:
-            macs = macs + [tv_mac.lower()]
+        macs = existing + ([tv_mac.lower()] if tv_mac and tv_mac.lower() not in existing else [])
         body = dict(pol)
         body["block_list"] = merged
         body["client_macs"] = macs
         self._req(f"/proxy/network/v2/api/site/{self.site}/content-filtering/{pid}", "PUT", body)
+        after = [p for p in self.policies() if (p.get("_id") or p.get("id")) == pid]  # read back
+        verified = bool(after) and set(BLOCKLIST).issubset(set(after[0].get("block_list") or []))
         added = len(merged) - len(block)
         print(f"  Content Filter '{policy_name}': {len(block)} existing + {added} added "
-              f"= {len(merged)} domains, scoped to {len(macs)} device(s)")
+              f"= {len(merged)} domains, scoped to {len(macs)} device(s). "
+              f"Read-back: {'OK' if verified else 'COULD NOT VERIFY -- check the UI'}")
+
+
+def _fritz_password(a):
+    if a.fritz_password_file:
+        return open(a.fritz_password_file).read().rstrip("\r\n")
+    return getpass.getpass("FRITZ!Box password: ")
 
 
 def main():
@@ -240,6 +310,8 @@ def main():
     ap.add_argument("--tv", help="TV IP address")
     ap.add_argument("--keep", default=KEEP_DEFAULT, help=f"apps left running (default {KEEP_DEFAULT})")
     ap.add_argument("--fritz-device", help="TV's name as shown in FRITZ!Box > Internet > Filter")
+    ap.add_argument("--list-fritz-devices", action="store_true",
+                    help="log in and list FRITZ!Box device names, then exit")
     ap.add_argument("--fritz-host", default="fritz.box")
     ap.add_argument("--fritz-user", help="defaults to the last user that logged in")
     ap.add_argument("--fritz-password-file", help="read password from file instead of prompting")
@@ -255,15 +327,22 @@ def main():
     if a.print_blocklist:
         print("\n".join(BLOCKLIST))
         return
+    if a.list_fritz_devices:
+        box = Fritz(a.fritz_host, a.fritz_user, _fritz_password(a))
+        try:
+            for name in sorted({t for t, _ in box.device_profiles().values()}):
+                print(name)
+        finally:
+            box.logout()
+        return
     if not (a.tv or a.fritz_device or a.unifi_host):
         ap.error("pass --tv and/or a router target (--fritz-device or --unifi-host)")
     if a.tv:
         tv_cleanup(a.tv, set(a.keep.split(",")))
     if a.fritz_device:
-        pw = (open(a.fritz_password_file).read().rstrip("\r\n") if a.fritz_password_file
-              else getpass.getpass("FRITZ!Box password: "))
-        box = Fritz(a.fritz_host, a.fritz_user, pw)
+        box = Fritz(a.fritz_host, a.fritz_user, _fritz_password(a))
         try:
+            box.require_device(a.fritz_device)  # validate BEFORE writing the shared block list
             box.merge_blocklist()
             box.assign(a.fritz_device, box.ensure_profile())
         finally:
